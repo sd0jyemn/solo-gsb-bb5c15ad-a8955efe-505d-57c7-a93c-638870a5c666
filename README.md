@@ -15,7 +15,11 @@ Intel HEX 映像按绝对地址叠加合并（同值归并并记录全部来源�
 还可把组装后的映像**重新导出为
 规范化 Intel HEX 文本**（按 `max_data_bytes` 确定性切分数据记录、任何记录不跨越
 64 KiB 地址窗口、窗口切换时输出扩展线性地址记录、全部记录重算二补校验和、可选保留
-入口地址），并返回导出的 HEX 文本与记录数。
+入口地址），并返回导出的 HEX 文本与记录数；也可在组装后的映像上**扫描若干带唯一名称的
+字节模式**（两位十六进制字节、`??` 单字节通配符与紧随的 `{n}` 重复次数，编译为
+value/mask 序列，按模式分别限定半开地址范围、起始地址对齐与期望命中数；只在连续固件段内
+匹配、不跨越空洞、允许同一模式重叠命中，按地址与模式输入顺序返回命中及 absent / unique /
+ambiguous / count_mismatch 状态）。
 
 ## 快速启动（单条命令）
 
@@ -893,6 +897,103 @@ curl -s -X POST http://localhost:8000/api/v1/image-merkle-manifest \
 - 同一逻辑映像无论数据记录如何分片（记录拆分、相同重写、段顺序变化），根与各块摘要
   完全一致——物化为固定网格后只有「绝对地址 + 字节内容」参与哈希。
 
+### `POST /api/v1/scan-byte-patterns`
+
+字节模式扫描：复用同一 Intel HEX 解析器组装映像，再在映像的**连续固件段**内查找若干
+**带唯一 `name` 的字节模式**。模式语法由空白分隔的单字节 token 构成：
+
+- 两位十六进制数（如 `AB`、`ff`）——固定字节；
+- `??`——单字节通配符，匹配任意值；
+- 任一 token 后可**紧随** `{n}`（无空格，`n` 为正十进制整数）重复该 token，
+  如 `FF{16}`（16 个 `FF`）、`??{4} AB CD`（4 个任意字节后接 `AB CD`）。
+
+服务端先把每个模式编译为等长的 **value / mask 字节序列**（固定字节为
+`(值, 0xFF)`，通配符为 `(0, 0x00)`），匹配时逐位判定
+`(固件字节 & mask) == value`。每个模式还可分别指定：
+
+- `start` / `end`：半开搜索窗口 `[start, end)`，缺省分别为 `0` 与
+  `0x100000000`（整个 32 位空间）；命中窗口的整个模式必须落在该窗口内；
+- `alignment`：命中起始地址必须是该值的倍数（缺省 1）；
+- `expected_count`：可选的期望命中数（≥ 0），实际数不同则该模式标记
+  `count_mismatch=true`。
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/scan-byte-patterns \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "hex_text": ":020000040800F2\n:10000000214601360121470136007EFE09D2190141\n:00000001FF\n",
+    "patterns": [
+      {"name": "branch",   "pattern": "?? 46", "alignment": 2, "expected_count": 1},
+      {"name": "fill",     "pattern": "FF{16}"},
+      {"name": "windowed", "pattern": "01 36", "start": 134217730, "end": 134217744, "alignment": 2}
+    ]
+  }' | jq
+```
+
+匹配语义：
+
+- **只在单个连续固件段内匹配，匹配绝不跨越段间空洞**：即使把空洞两侧的字节连起来恰好
+  符合模式，也不会报告该命中。
+- 候选起始地址按 `alignment` 步进，因此**未对齐的起始地址永不命中**；同一模式的
+  **重叠命中全部报告**（例如在 `11 11 11` 上对齐 1 扫描 `11 11` 得到两个命中）。
+- HEX 解析、模式语法、各模式范围/对齐**任一无效即不扫描**，但会在一次响应里
+  **汇总全部诊断**：HEX 的逐行 `diagnostics` 与逐模式的 `pattern_errors`
+  （`kind` 为 `invalid_pattern_syntax` / `pattern_too_long` /
+  `invalid_pattern_range` / `invalid_pattern_alignment`，语法错误还带
+  `position` 字符偏移）。
+- 成功时每个模式给出状态：`absent`（0 命中）、`unique`（恰好 1 命中）、
+  `ambiguous`（多于 1 命中）；`expected_count` 与实际数不符时额外置
+  `count_mismatch=true`（`count_mismatch` 不改变 `status`，模式未给
+  `expected_count` 时恒为 `false`）。
+- `results[]` 严格按请求顺序给出每个模式的全部命中（地址升序）；顶层扁平 `hits[]`
+  按**地址升序、同地址再按模式输入顺序**排列。
+
+上例响应（恒为 200；`?? 46` 在 `0x08000000` 唯一命中，`FF{16}` 无命中，
+窗口内的 `01 36` 命中 `0x08000002`）：
+
+```json
+{
+  "ok": true,
+  "hex_ok": true,
+  "patterns_valid": true,
+  "error_count": 0,
+  "warning_count": 0,
+  "entry_address": null,
+  "total_bytes": 16,
+  "pattern_count": 3,
+  "total_hits": 2,
+  "results": [
+    {"name": "branch", "pattern": "?? 46", "status": "unique", "count": 1,
+     "expected_count": 1, "count_mismatch": false,
+     "start": 0, "end": 4294967296, "alignment": 2,
+     "hits": [{"pattern": "branch", "address": 134217728, "end": 134217730, "length": 2}]},
+    {"name": "fill", "pattern": "FF{16}", "status": "absent", "count": 0,
+     "expected_count": null, "count_mismatch": false,
+     "start": 0, "end": 4294967296, "alignment": 1, "hits": []},
+    {"name": "windowed", "pattern": "01 36", "status": "unique", "count": 1,
+     "expected_count": null, "count_mismatch": false,
+     "start": 134217730, "end": 134217744, "alignment": 2,
+     "hits": [{"pattern": "windowed", "address": 134217730, "end": 134217732, "length": 2}]}
+  ],
+  "hits": [
+    {"pattern": "branch", "address": 134217728, "end": 134217730, "length": 2},
+    {"pattern": "windowed", "address": 134217730, "end": 134217732, "length": 2}
+  ],
+  "pattern_errors": [],
+  "diagnostics": [ ... ]
+}
+```
+
+- 命中条目给出 `pattern`、起始 `address`、开区间 `end` 与编译后 `length`。
+- `results[].start/end/alignment` 回显**生效后**的窗口与对齐（含缺省值）。
+- HEX 无效、或任何模式存在 `pattern_errors` 时：`ok=false`、`results`/`hits`
+  为空、`total_hits=0`；HEX 本身有效时 `hex_ok=true`，模式全部合法时
+  `patterns_valid=true`（两者独立检查，因此可能同时为假）。
+- 编译后的模式长度上限为 65536 字节（防止 `{n}` 放大），超限为
+  `pattern_too_long`。
+- 请求级结构问题仍返回 422：`patterns` 为空列表、`name` 为空或**重名**、
+  `alignment` < 1、`expected_count` < 0、`start`/`end` 为负数等。
+
 ## 解析规则
 
 - 每行必须形如 `:llaaaatt<data>cc`；校验 `ll`（字节数）与实际数据长度一致，
@@ -923,6 +1024,7 @@ app/
   image_digest.py # 整像内容指纹（段帧规范化编码 + 整像/每段 SHA-256 + 规范化清单，纯逻辑）
   image_merkle.py # 分块 Merkle 清单（0xFF 物化、u32be 地址叶、奇数层复制末节点、有方向证明，纯逻辑）
   hex_export.py   # Intel HEX 规范化导出（确定性记录重排、64 KiB 窗口切分、校验和重算，纯逻辑）
+  byte_scan.py    # 字节模式扫描（?? 通配符/{n} 重复编译为 value/mask、范围/对齐校验、段内重叠匹配不跨空洞，纯逻辑）
 tests/
   test_hex_service.py           # 解析器与 assemble 接口
   test_validate_layout.py       # validate-layout 接口与布局逻辑
@@ -934,6 +1036,7 @@ tests/
   test_image_digest.py          # image-digest 接口与内容指纹逻辑（分片/空洞不变性等）
   test_image_merkle_manifest.py # image-merkle-manifest 接口与分块 Merkle/证明逻辑（物化、复制末节点、折叠验证等）
   test_export_hex.py            # export-hex 接口与规范化导出逻辑（窗口切分、不动点等）
+  test_scan_byte_patterns.py    # scan-byte-patterns 接口与模式编译/范围对齐/段内重叠匹配逻辑
 Dockerfile
 docker-compose.yml
 requirements.txt       # 运行依赖

@@ -9,6 +9,14 @@ from fastapi import Body, FastAPI
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field, model_validator
 
+from .byte_scan import (
+    ADDR_SPAN as SCAN_ADDR_SPAN,
+    CompiledPattern,
+    PatternError as BytePatternError,
+    compile_pattern,
+    find_hits,
+    validate_scope,
+)
 from .hex_export import export_intel_hex
 from .hex_parser import ParseResult, parse_intel_hex
 from .image_digest import build_image_digest
@@ -45,6 +53,11 @@ app = FastAPI(
         "chunk-aligned binary SHA-256 Merkle manifest over an explicit "
         "address range (missing bytes materialized as 0xFF, at most 4096 "
         "chunks) with directional sibling proofs for selected addresses. "
+        "It can also scan the assembled firmware for uniquely named byte "
+        "patterns (hex bytes, '??' wildcards and '{n}' repeats, compiled "
+        "to value/mask sequences), restricted per pattern to a half-open "
+        "address range and an address alignment, with matches confined to "
+        "contiguous firmware segments and allowed to overlap. "
         "The assembled image can also be re-emitted as a normalized Intel HEX text: deterministic "
         "data-record layout bounded by a configurable byte count, no "
         "record crossing a 64 KiB address window, extended linear "
@@ -1010,6 +1023,176 @@ class ImageMerkleManifestResponse(BaseModel):
     diagnostics: list[DiagnosticOut]
 
 
+class BytePatternIn(BaseModel):
+    name: str = Field(..., min_length=1, description="Unique label identifying this pattern")
+    pattern: str = Field(
+        ...,
+        description=(
+            "Whitespace-separated byte tokens: two hex digits ('AB'), a '??' "
+            "single-byte wildcard, optionally followed by '{n}' repeating the "
+            "token n (>=1) times"
+        ),
+    )
+    start: int | None = Field(
+        None, ge=0, description="Inclusive search-window start; null means address 0"
+    )
+    end: int | None = Field(
+        None,
+        ge=0,
+        description="Exclusive search-window end; null means 0x100000000",
+    )
+    alignment: int = Field(
+        1, ge=1, description="Match start addresses must be divisible by this value"
+    )
+    expected_count: int | None = Field(
+        None,
+        ge=0,
+        description="If set, the hit count must equal this value or the pattern is a count_mismatch",
+    )
+
+
+class ScanBytePatternsRequest(BaseModel):
+    hex_text: str = Field(..., description="Intel HEX text, one record per line")
+    patterns: list[BytePatternIn] = Field(
+        ...,
+        min_length=1,
+        description="Uniquely named patterns to scan for; each name must be unique",
+    )
+
+    @model_validator(mode="after")
+    def _require_unique_pattern_names(self) -> ScanBytePatternsRequest:
+        seen: set[str] = set()
+        duplicates = [
+            p.name for p in self.patterns if p.name in seen or seen.add(p.name)
+        ]
+        if duplicates:
+            raise ValueError(
+                "pattern names must be unique; duplicate name(s): "
+                + ", ".join(sorted(set(duplicates)))
+            )
+        return self
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "hex_text": (
+                        ":020000040800F2\n"
+                        ":10000000214601360121470136007EFE09D2190141\n"
+                        ":00000001FF\n"
+                    ),
+                    "patterns": [
+                        {
+                            "name": "thumb_branch",
+                            "pattern": "21 46",
+                            "start": None,
+                            "end": None,
+                            "alignment": 2,
+                            "expected_count": 1,
+                        },
+                        {
+                            "name": "sixteen_ff",
+                            "pattern": "FF{16}",
+                            "start": None,
+                            "end": None,
+                            "alignment": 1,
+                            "expected_count": None,
+                        },
+                        {
+                            "name": "halfword",
+                            "pattern": "?? 01",
+                            "start": 134217728,
+                            "end": 134217744,
+                            "alignment": 2,
+                            "expected_count": None,
+                        },
+                    ],
+                }
+            ]
+        }
+    }
+
+
+
+class BytePatternErrorOut(BaseModel):
+    kind: str = Field(
+        ...,
+        description=(
+            "invalid_pattern_syntax | pattern_too_long | "
+            "invalid_pattern_range | invalid_pattern_alignment"
+        ),
+    )
+    pattern: str | None = Field(None, description="Offending pattern name, when attributable")
+    message: str
+    position: int | None = Field(
+        None, description="0-based character offset into the pattern syntax, for syntax errors"
+    )
+    start: int | None = Field(None, description="Window start, when relevant")
+    end: int | None = Field(None, description="Exclusive window end, when relevant")
+    alignment: int | None = Field(None, description="Requested alignment, when relevant")
+
+
+class BytePatternHitOut(BaseModel):
+    pattern: str = Field(..., description="Name of the matched pattern")
+    address: int = Field(..., description="Absolute start address of the match")
+    end: int = Field(..., description="Exclusive end address (address + pattern length)")
+    length: int = Field(..., description="Compiled pattern length in bytes")
+
+
+class BytePatternResultOut(BaseModel):
+    name: str = Field(..., description="Pattern name as given in the request")
+    pattern: str = Field(..., description="Pattern syntax as given in the request")
+    status: str = Field(
+        ...,
+        description="absent (no hits) | unique (exactly one hit) | ambiguous (more than one hit)",
+    )
+    count: int = Field(..., description="Number of hits found")
+    expected_count: int | None = Field(..., description="Echoes the request")
+    count_mismatch: bool = Field(
+        ...,
+        description="True when expected_count was set and differs from count",
+    )
+    start: int = Field(..., description="Effective inclusive search-window start")
+    end: int = Field(..., description="Effective exclusive search-window end")
+    alignment: int = Field(..., description="Echoes the effective alignment")
+    hits: list[BytePatternHitOut] = Field(
+        ..., description="This pattern's hits in ascending address order"
+    )
+
+
+class ScanBytePatternsResponse(BaseModel):
+    ok: bool = Field(
+        ...,
+        description="True only when the HEX parses and every pattern, range and alignment is valid",
+    )
+    hex_ok: bool = Field(..., description="True when the Intel HEX text passed validation")
+    patterns_valid: bool = Field(
+        ...,
+        description="True when every pattern syntax, range and alignment is valid",
+    )
+    error_count: int = Field(..., description="Error diagnostics from the HEX parse")
+    warning_count: int = Field(..., description="Warning diagnostics from the HEX parse")
+    entry_address: int | None = Field(None, description="From the last 03/05 record, if present")
+    total_bytes: int = Field(..., description="Sum of firmware segment byte counts")
+    pattern_count: int = Field(..., description="Number of patterns supplied")
+    total_hits: int = Field(
+        ..., description="Total matches across every pattern (0 when no scan ran)"
+    )
+    results: list[BytePatternResultOut] = Field(
+        ...,
+        description="Per-pattern outcome in request order; empty when no scan ran",
+    )
+    hits: list[BytePatternHitOut] = Field(
+        ...,
+        description="Every match sorted by address then by pattern input order; empty when no scan ran",
+    )
+    pattern_errors: list[BytePatternErrorOut] = Field(
+        ...,
+        description="Every pattern-level problem; any error prevents scanning",
+    )
+    diagnostics: list[DiagnosticOut]
+
+
 def _build_response(result: ParseResult) -> AssembleResponse:
     return AssembleResponse(
         ok=result.ok,
@@ -1867,5 +2050,132 @@ def image_merkle_manifest_route(
             for proof in manifest.proofs
         ],
         param_errors=[MerkleParamErrorOut(**vars(e)) for e in manifest.param_errors],
+        **base_fields,
+    )
+
+
+@app.post(
+    "/api/v1/scan-byte-patterns",
+    response_model=ScanBytePatternsResponse,
+    tags=["scan"],
+)
+def scan_byte_patterns_route(
+    request: ScanBytePatternsRequest,
+) -> ScanBytePatternsResponse:
+    """Scan assembled firmware segments for uniquely named byte patterns.
+
+    The HEX text is parsed with the shared validator; parse diagnostics
+    are returned as for every other endpoint. Independently, every
+    pattern is compiled from hexadecimal byte tokens, ``??`` single-byte
+    wildcards and ``{n}`` repeats into parallel value/mask sequences.
+    Each pattern may constrain matches to a half-open window
+    ``[start, end)`` (defaults: ``0``..``0x100000000``) and to start
+    addresses divisible by ``alignment`` (default 1). Invalid HEX,
+    pattern syntax, ranges or alignments are all diagnosed in a single
+    response and no scanning runs. Otherwise each value/mask pattern is
+    searched only inside contiguous firmware segments, so a match can
+    never bridge an address hole; aligned, overlapping matches of the
+    same pattern are all reported. Per-pattern status is ``absent``,
+    ``unique`` or ``ambiguous``; a set ``expected_count`` differing from
+    the actual count additionally marks ``count_mismatch``. The flat
+    ``hits`` list is sorted by address and then by pattern input order.
+    """
+    parsed = parse_intel_hex(request.hex_text)
+    diagnostics = [DiagnosticOut(**vars(d)) for d in parsed.diagnostics]
+
+    # Compile every pattern regardless of HEX outcome so that a single
+    # response surfaces both parse and pattern problems.
+    compiled: list[CompiledPattern] = [
+        compile_pattern(p.name, p.pattern) for p in request.patterns
+    ]
+    errors: list[BytePatternError] = []
+    for pattern, spec in zip(compiled, request.patterns):
+        errors.extend(pattern.errors)
+        if pattern.valid:
+            errors.extend(
+                validate_scope(
+                    pattern.name,
+                    0 if spec.start is None else spec.start,
+                    SCAN_ADDR_SPAN if spec.end is None else spec.end,
+                    spec.alignment,
+                    pattern.length,
+                )
+            )
+
+    base_fields = dict(
+        error_count=parsed.error_count,
+        warning_count=parsed.warning_count,
+        entry_address=parsed.entry_address,
+        total_bytes=parsed.total_bytes,
+        pattern_count=len(request.patterns),
+        diagnostics=diagnostics,
+    )
+    if not parsed.ok or errors:
+        return ScanBytePatternsResponse(
+            ok=False,
+            hex_ok=parsed.ok,
+            patterns_valid=not errors,
+            total_hits=0,
+            results=[],
+            hits=[],
+            pattern_errors=[BytePatternErrorOut(**vars(e)) for e in errors],
+            **base_fields,
+        )
+
+    results: list[BytePatternResultOut] = []
+    ordered_hits: list[BytePatternHitOut] = []
+    total_hits = 0
+    for index, (pattern, spec) in enumerate(zip(compiled, request.patterns)):
+        window_start = 0 if spec.start is None else spec.start
+        window_end = SCAN_ADDR_SPAN if spec.end is None else spec.end
+        addresses = find_hits(
+            parsed.segments,
+            pattern,
+            window_start,
+            window_end,
+            spec.alignment,
+        )
+        hit_items = [
+            BytePatternHitOut(
+                pattern=pattern.name,
+                address=address,
+                end=address + pattern.length,
+                length=pattern.length,
+            )
+            for address in addresses
+        ]
+        total_hits += len(hit_items)
+        count = len(hit_items)
+        status = "absent" if count == 0 else ("unique" if count == 1 else "ambiguous")
+        count_mismatch = (
+            spec.expected_count is not None and spec.expected_count != count
+        )
+        results.append(
+            BytePatternResultOut(
+                name=pattern.name,
+                pattern=pattern.syntax,
+                status=status,
+                count=count,
+                expected_count=spec.expected_count,
+                count_mismatch=count_mismatch,
+                start=window_start,
+                end=window_end,
+                alignment=spec.alignment,
+                hits=hit_items,
+            )
+        )
+        # Flat ordering: ascending address, ties broken by request order.
+        for hit in hit_items:
+            ordered_hits.append((hit.address, index, hit))
+
+    ordered_hits.sort(key=lambda item: (item[0], item[1]))
+    return ScanBytePatternsResponse(
+        ok=True,
+        hex_ok=True,
+        patterns_valid=True,
+        total_hits=total_hits,
+        results=results,
+        hits=[hit for _, _, hit in ordered_hits],
+        pattern_errors=[],
         **base_fields,
     )
