@@ -15,6 +15,7 @@ from .image_digest import build_image_digest
 from .image_merkle import build_merkle_manifest
 from .image_merge import MergeSource, merge_images
 from .layout import Region, validate_layout
+from .pattern_scan import PatternSpec, compile_patterns, scan_patterns
 from .relocation import plan_relocation
 from .flash_update import plan_flash_update
 from .flash_verify import (
@@ -49,7 +50,15 @@ app = FastAPI(
         "data-record layout bounded by a configurable byte count, no "
         "record crossing a 64 KiB address window, extended linear "
         "address records on window switches, recomputed checksums and "
-        "optional entry-address preservation."
+        "optional entry-address preservation. It can also be scanned for "
+        "a set of uniquely named byte patterns: tokens of two hex digits, "
+        "'??' single-byte wildcards and '{n}' repeats compile to "
+        "value/mask sequences that are searched within contiguous "
+        "segments only (matches never cross gaps, overlaps allowed), "
+        "with optional per-pattern half-open address range, alignment "
+        "and expected hit count; hits are returned ordered by address "
+        "then pattern input order with absent/unique/ambiguous/"
+        "count_mismatch statuses."
     ),
 )
 
@@ -1010,6 +1019,141 @@ class ImageMerkleManifestResponse(BaseModel):
     diagnostics: list[DiagnosticOut]
 
 
+class BytePatternIn(BaseModel):
+    name: str = Field(..., min_length=1, description="Unique label identifying this pattern")
+    pattern: str = Field(
+        ...,
+        description=(
+            "Whitespace-separated tokens: an exact byte (two hex digits) or the "
+            "single-byte wildcard '??', each optionally followed by a '{n}' repeat count"
+        ),
+    )
+    range_start: int | None = Field(
+        None,
+        description="Inclusive start of the hit-address window; both ends or neither",
+    )
+    range_end: int | None = Field(
+        None,
+        description="Exclusive end of the hit-address window; both ends or neither",
+    )
+    alignment: int = Field(
+        1, description="Hit start addresses must be multiples of this value (>= 1)"
+    )
+    expected_count: int | None = Field(
+        None, description="Optional expected hit count; a mismatch yields count_mismatch"
+    )
+
+
+class ScanBytePatternsRequest(BaseModel):
+    hex_text: str = Field(..., description="Intel HEX text, one record per line")
+    patterns: list[BytePatternIn] = Field(
+        ..., min_length=1, description="Patterns to scan for; every name must be unique"
+    )
+
+    @model_validator(mode="after")
+    def _require_unique_names(self) -> ScanBytePatternsRequest:
+        seen: set[str] = set()
+        duplicates = [p.name for p in self.patterns if p.name in seen or seen.add(p.name)]
+        if duplicates:
+            raise ValueError(
+                "pattern names must be unique; duplicate name(s): "
+                + ", ".join(sorted(set(duplicates)))
+            )
+        return self
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "hex_text": (
+                        ":020000040800F2\n"
+                        ":10000000214601360121470136007EFE09D2190141\n"
+                        ":04000005080001C12D\n"
+                        ":00000001FF\n"
+                    ),
+                    "patterns": [
+                        {"name": "thumb_branch", "pattern": "01 36", "expected_count": 2},
+                        {
+                            "name": "wildcard_pair",
+                            "pattern": "7E ?? 09",
+                            "range_start": 134217728,
+                            "range_end": 134217744,
+                        },
+                        {"name": "padding", "pattern": "FF{4}"},
+                    ],
+                }
+            ]
+        }
+    }
+
+
+class PatternErrorOut(BaseModel):
+    kind: str = Field(
+        ...,
+        description=(
+            "invalid_pattern_syntax | pattern_too_long | invalid_range | "
+            "invalid_alignment | invalid_expected_count"
+        ),
+    )
+    message: str
+    pattern: str | None = Field(None, description="Name of the offending pattern")
+    index: int | None = Field(None, description="Index of the offending pattern (0-based)")
+
+
+class PatternMatchOut(BaseModel):
+    pattern: str = Field(..., description="Name of the pattern that produced this hit")
+    pattern_index: int = Field(..., description="Index of the pattern in the request (0-based)")
+    address: int = Field(..., description="Absolute start address of the match")
+    end: int = Field(..., description="Exclusive end address")
+    size: int
+    data_base64: str = Field(..., description="Base64-encoded matched bytes")
+
+
+class PatternResultOut(BaseModel):
+    name: str
+    index: int = Field(..., description="Index of the pattern in the request (0-based)")
+    pattern: str = Field(..., description="Pattern source text as given in the request")
+    status: str = Field(..., description="absent | unique | ambiguous | count_mismatch")
+    hit_count: int
+    expected_count: int | None
+    compiled_length: int = Field(..., description="Compiled value/mask length in bytes")
+    range_start: int | None
+    range_end: int | None
+    alignment: int
+    match_addresses: list[int] = Field(
+        ..., description="Hit start addresses in ascending order"
+    )
+
+
+class ScanBytePatternsResponse(BaseModel):
+    ok: bool = Field(
+        ...,
+        description="True when the inputs are valid and every expected_count was met",
+    )
+    hex_ok: bool = Field(..., description="True when the Intel HEX text passed validation")
+    patterns_valid: bool = Field(
+        ...,
+        description="True when every pattern compiled and all per-pattern parameters "
+        "are valid; the scan only runs when this and hex_ok are true",
+    )
+    error_count: int
+    warning_count: int
+    entry_address: int | None = Field(None, description="From the last 03/05 record, if present")
+    total_bytes: int
+    pattern_count: int
+    match_count: int
+    matches: list[PatternMatchOut] = Field(
+        ..., description="Every hit, ordered by address then pattern input order"
+    )
+    patterns: list[PatternResultOut] = Field(
+        ..., description="Per-pattern outcome in request order; empty when no scan ran"
+    )
+    pattern_errors: list[PatternErrorOut] = Field(
+        ..., description="Pattern-level problems; non-empty only when patterns_valid is false"
+    )
+    diagnostics: list[DiagnosticOut]
+
+
 def _build_response(result: ParseResult) -> AssembleResponse:
     return AssembleResponse(
         ok=result.ok,
@@ -1867,5 +2011,106 @@ def image_merkle_manifest_route(
             for proof in manifest.proofs
         ],
         param_errors=[MerkleParamErrorOut(**vars(e)) for e in manifest.param_errors],
+        **base_fields,
+    )
+
+
+@app.post(
+    "/api/v1/scan-byte-patterns",
+    response_model=ScanBytePatternsResponse,
+    tags=["scan"],
+)
+def scan_byte_patterns_route(request: ScanBytePatternsRequest) -> ScanBytePatternsResponse:
+    """Scan the assembled image for a set of uniquely named byte patterns.
+
+    The HEX text is parsed with the shared validator and every pattern
+    is compiled to a value/mask sequence (exact byte -> mask ``0xFF``,
+    ``??`` wildcard -> mask ``0x00``, ``{n}`` repeats the preceding
+    token). When the HEX text, any pattern's syntax, range, alignment or
+    expected count is invalid, **all** diagnostics are aggregated and no
+    scan runs. Otherwise each contiguous firmware segment is searched
+    independently: a match never crosses an inter-segment gap and
+    overlapping matches are reported. A hit start address must lie
+    inside the pattern's half-open range (when given) and be a multiple
+    of its alignment. Per pattern the status is
+    ``absent``/``unique``/``ambiguous`` by hit count, or
+    ``count_mismatch`` when an ``expected_count`` was given and not met.
+    Hits are returned ordered by address, then pattern input order.
+    """
+    parsed = parse_intel_hex(request.hex_text)
+    diagnostics = [DiagnosticOut(**vars(d)) for d in parsed.diagnostics]
+    specs = [
+        PatternSpec(
+            name=p.name,
+            index=i,
+            source=p.pattern,
+            range_start=p.range_start,
+            range_end=p.range_end,
+            alignment=p.alignment,
+            expected_count=p.expected_count,
+        )
+        for i, p in enumerate(request.patterns)
+    ]
+    compiled, pattern_errors = compile_patterns(specs)
+    base_fields = dict(
+        error_count=parsed.error_count,
+        warning_count=parsed.warning_count,
+        entry_address=parsed.entry_address,
+        total_bytes=parsed.total_bytes,
+        pattern_count=len(request.patterns),
+        diagnostics=diagnostics,
+    )
+    if not parsed.ok or pattern_errors:
+        return ScanBytePatternsResponse(
+            ok=False,
+            hex_ok=parsed.ok,
+            patterns_valid=not pattern_errors,
+            match_count=0,
+            matches=[],
+            patterns=[],
+            pattern_errors=[
+                PatternErrorOut(
+                    kind=e.kind, message=e.message, pattern=e.name, index=e.index
+                )
+                for e in pattern_errors
+            ],
+            **base_fields,
+        )
+
+    result = scan_patterns(parsed.segments, compiled)
+    names = {p.index: p.name for p in compiled}
+    return ScanBytePatternsResponse(
+        ok=result.ok,
+        hex_ok=True,
+        patterns_valid=True,
+        match_count=len(result.matches),
+        matches=[
+            PatternMatchOut(
+                pattern=names[m.pattern_index],
+                pattern_index=m.pattern_index,
+                address=m.address,
+                end=m.end,
+                size=m.size,
+                data_base64=base64.b64encode(m.data).decode("ascii"),
+            )
+            for m in result.matches
+        ],
+        patterns=[
+            PatternResultOut(
+                name=r.name,
+                index=r.index,
+                pattern=r.source,
+                status=r.status,
+                hit_count=r.hit_count,
+                expected_count=r.expected_count,
+                compiled_length=r.compiled_length,
+                range_start=r.range_start,
+                range_end=r.range_end,
+                alignment=r.alignment,
+                match_addresses=r.match_addresses,
+            )
+            for r in result.reports
+        ],
+        pattern_errors=[],
         **base_fields,
     )

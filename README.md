@@ -15,7 +15,11 @@ Intel HEX 映像按绝对地址叠加合并（同值归并并记录全部来源�
 还可把组装后的映像**重新导出为
 规范化 Intel HEX 文本**（按 `max_data_bytes` 确定性切分数据记录、任何记录不跨越
 64 KiB 地址窗口、窗口切换时输出扩展线性地址记录、全部记录重算二补校验和、可选保留
-入口地址），并返回导出的 HEX 文本与记录数。
+入口地址），并返回导出的 HEX 文本与记录数；也可对映像做**字节模式扫描**：若干唯一命名
+的模式（两位十六进制字节、`??` 单字节通配符与紧随的 `{n}` 重复）先编译为 value/mask
+序列，再只在连续固件段内查找（命中不跨空洞、允许重叠命中），每个模式可分别指定半开
+地址范围、地址对齐与期望命中数，命中按地址与模式输入顺序返回，并给出
+absent/unique/ambiguous/count_mismatch 状态。
 
 ## 快速启动（单条命令）
 
@@ -893,6 +897,93 @@ curl -s -X POST http://localhost:8000/api/v1/image-merkle-manifest \
 - 同一逻辑映像无论数据记录如何分片（记录拆分、相同重写、段顺序变化），根与各块摘要
   完全一致——物化为固定网格后只有「绝对地址 + 字节内容」参与哈希。
 
+### `POST /api/v1/scan-byte-patterns`
+
+字节模式扫描：复用同一 Intel HEX 解析器组装映像，再按一组**唯一命名**的字节模式
+查找命中。模式为空白分隔的 token 序列，每个 token 是**两位十六进制精确字节**
+（大小写不限）或**单字节通配符 `??`**，并可紧跟 **`{n}` 重复次数**（`n >= 1`：
+`DE{3}` 等价于 `DE DE DE`，`??{4}` 为 4 个通配字节）。服务端先把每个模式编译为
+value/mask 序列（精确字节 mask=`0xFF`、通配符 mask=`0x00`，编译长度上限 4096 字节），
+再**只在连续固件段内**查找：命中绝不跨越段间空洞，同一模式允许重叠命中。
+
+每个模式还可分别指定：
+
+- `range_start` / `range_end`：半开命中地址窗口，**必须同时给出或同时省略**；
+  命中的**起始地址**必须落在 `[range_start, range_end)` 内（命中字节可延伸至
+  `range_end` 之外，但仍不得跨段）；
+- `alignment`：命中起始地址必须是它的整数倍（默认 `1`，必须为正整数）；
+- `expected_count`：期望命中数（`>= 0`）；实际命中数不符时该模式状态为
+  `count_mismatch`。
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/scan-byte-patterns \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "hex_text": ":020000040800F2\n:10000000214601360121470136007EFE09D2190141\n:04000005080001C12D\n:00000001FF\n",
+    "patterns": [
+      {"name": "thumb_branch",  "pattern": "01 36", "expected_count": 2},
+      {"name": "wildcard_pair", "pattern": "7E ?? 09",
+       "range_start": 134217728, "range_end": 134217744},
+      {"name": "padding",       "pattern": "FF{4}"}
+    ]
+  }' | jq
+```
+
+前置校验（恒返回 200，以 `ok` 判定）：
+
+- **HEX 无效、任一模式的语法/范围/对齐/期望数无效时，汇总全部诊断且不扫描**：
+  `hex_ok` 与 `patterns_valid` 分别标记两类校验结果，`diagnostics` 为 HEX 逐行诊断，
+  `pattern_errors` 按模式输入顺序给出每个模式的问题（`invalid_pattern_syntax` /
+  `pattern_too_long` / `invalid_range` / `invalid_alignment` /
+  `invalid_expected_count`，含模式名与下标），此时 `matches`/`patterns` 为空。
+- 模式名必须唯一、至少一个模式、模式名非空，否则返回 422。
+
+上例响应：
+
+```json
+{
+  "ok": true,
+  "hex_ok": true,
+  "patterns_valid": true,
+  "error_count": 0,
+  "warning_count": 0,
+  "entry_address": 134218177,
+  "total_bytes": 16,
+  "pattern_count": 3,
+  "match_count": 3,
+  "matches": [
+    {"pattern": "thumb_branch", "pattern_index": 0, "address": 134217730,
+     "end": 134217732, "size": 2, "data_base64": "ATY="},
+    {"pattern": "thumb_branch", "pattern_index": 0, "address": 134217735,
+     "end": 134217737, "size": 2, "data_base64": "ATY="},
+    {"pattern": "wildcard_pair", "pattern_index": 1, "address": 134217738,
+     "end": 134217741, "size": 3, "data_base64": "fv4J"}
+  ],
+  "patterns": [
+    {"name": "thumb_branch", "index": 0, "pattern": "01 36", "status": "ambiguous",
+     "hit_count": 2, "expected_count": 2, "compiled_length": 2,
+     "range_start": null, "range_end": null, "alignment": 1,
+     "match_addresses": [134217730, 134217735]},
+    {"name": "wildcard_pair", "index": 1, "pattern": "7E ?? 09", "status": "unique",
+     "hit_count": 1, "expected_count": null, "compiled_length": 3,
+     "range_start": 134217728, "range_end": 134217744, "alignment": 1,
+     "match_addresses": [134217738]},
+    {"name": "padding", "index": 2, "pattern": "FF{4}", "status": "absent",
+     "hit_count": 0, "expected_count": null, "compiled_length": 4,
+     "range_start": null, "range_end": null, "alignment": 1, "match_addresses": []}
+  ],
+  "pattern_errors": [],
+  "diagnostics": [ ... ]
+}
+```
+
+- 每个模式的状态：0 次命中 `absent`、1 次 `unique`、多次 `ambiguous`；给了
+  `expected_count` 且实际命中数不符时一律为 `count_mismatch`（优先于前三者）。
+- `matches[]` 按**命中地址、模式输入顺序**排序，`data_base64` 为实际命中的字节；
+  `patterns[]` 按请求顺序给出每个模式的状态、命中数与命中地址列表。
+- `ok` 在 HEX 与全部模式合法、且没有任何 `count_mismatch` 时为 `true`；
+  `absent`/`unique`/`ambiguous` 本身不影响 `ok`。
+
 ## 解析规则
 
 - 每行必须形如 `:llaaaatt<data>cc`；校验 `ll`（字节数）与实际数据长度一致，
@@ -923,6 +1014,7 @@ app/
   image_digest.py # 整像内容指纹（段帧规范化编码 + 整像/每段 SHA-256 + 规范化清单，纯逻辑）
   image_merkle.py # 分块 Merkle 清单（0xFF 物化、u32be 地址叶、奇数层复制末节点、有方向证明，纯逻辑）
   hex_export.py   # Intel HEX 规范化导出（确定性记录重排、64 KiB 窗口切分、校验和重算，纯逻辑）
+  pattern_scan.py # 字节模式扫描（token 编译为 value/mask、段内查找不跨空洞、范围/对齐/期望数校验，纯逻辑）
 tests/
   test_hex_service.py           # 解析器与 assemble 接口
   test_validate_layout.py       # validate-layout 接口与布局逻辑
@@ -934,6 +1026,7 @@ tests/
   test_image_digest.py          # image-digest 接口与内容指纹逻辑（分片/空洞不变性等）
   test_image_merkle_manifest.py # image-merkle-manifest 接口与分块 Merkle/证明逻辑（物化、复制末节点、折叠验证等）
   test_export_hex.py            # export-hex 接口与规范化导出逻辑（窗口切分、不动点等）
+  test_scan_byte_patterns.py    # scan-byte-patterns 接口与模式编译/扫描逻辑（通配、重复、范围/对齐、状态判定等）
 Dockerfile
 docker-compose.yml
 requirements.txt       # 运行依赖
